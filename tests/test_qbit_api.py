@@ -91,7 +91,7 @@ def test_qbit_state_mapping():
                            STATE_ERROR, STATE_QUEUED, Torrent)
     mk = lambda **k: Torrent(hash="a" * 40, name="x", **k)
     assert qbit_api._qbit_state(mk(state=STATE_ERROR)) == "error"
-    assert qbit_api._qbit_state(mk(state=STATE_COMPLETED)) == "pausedUP"
+    assert qbit_api._qbit_state(mk(state=STATE_COMPLETED)) == "stoppedUP"  # "pausedUP"
     assert qbit_api._qbit_state(mk(state=STATE_DOWNLOADING)) == "downloading"
     assert qbit_api._qbit_state(mk(state=STATE_QUEUED)) == "metaDL"
     assert qbit_api._qbit_state(mk(state=STATE_CLOUD, dlspeed=0)) == "stalledDL"

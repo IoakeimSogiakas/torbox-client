@@ -233,7 +233,7 @@ def _qbit_state(t: Torrent) -> str:
     if t.state == STATE_ERROR:
         return "error"
     if t.state == STATE_COMPLETED:
-        return "pausedUP"  # finished + safe to import/remove
+        return "stoppedUP"  # previously was "pausedUP" finished + safe to import/remove
     if t.state == STATE_DOWNLOADING:
         return "downloading"
     if t.state == STATE_QUEUED:
@@ -266,7 +266,7 @@ def _to_qbit(t: Torrent) -> dict:
         "num_leechs": 0,
         "num_incomplete": 0,
         "ratio": 0.0,
-        "ratio_limit": -1,
+        "ratio_limit": 0,
         "eta": eta,
         "state": _qbit_state(t),
         "category": t.category,
@@ -282,7 +282,7 @@ def _to_qbit(t: Torrent) -> dict:
         "amount_left": amount_left,
         "time_active": max(now - (t.added_on or now), 0),
         "seeding_time": 0,
-        "seeding_time_limit": -1,
+        "seeding_time_limit": 0,
         "last_activity": t.last_update or now,
         "auto_tmm": False,
         "availability": 1.0 if progress >= 1 else -1.0,
