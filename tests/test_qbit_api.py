@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from app import qbit_api
@@ -91,11 +93,22 @@ def test_qbit_state_mapping():
                            STATE_ERROR, STATE_QUEUED, Torrent)
     mk = lambda **k: Torrent(hash="a" * 40, name="x", **k)
     assert qbit_api._qbit_state(mk(state=STATE_ERROR)) == "error"
-    assert qbit_api._qbit_state(mk(state=STATE_COMPLETED)) == "stoppedUP"  # "pausedUP"
+    assert qbit_api._qbit_state(mk(state=STATE_COMPLETED)) == "pausedUP"
     assert qbit_api._qbit_state(mk(state=STATE_DOWNLOADING)) == "downloading"
     assert qbit_api._qbit_state(mk(state=STATE_QUEUED)) == "metaDL"
     assert qbit_api._qbit_state(mk(state=STATE_CLOUD, dlspeed=0)) == "stalledDL"
     assert qbit_api._qbit_state(mk(state=STATE_CLOUD, dlspeed=5)) == "downloading"
+
+
+def test_cloud_finished_reports_queued_not_stalled():
+    """TorBox is done; we are waiting for a local pull slot. Sonarr renders
+    stalledDL as "The download is stalled with no connections" — queuedDL is
+    both accurate and free of the false alarm."""
+    from app.store import STATE_CLOUD, Torrent
+    mk = lambda **k: Torrent(hash="a" * 40, name="x", state=STATE_CLOUD, **k)
+    assert qbit_api._qbit_state(mk(cloud_progress=1.0, dlspeed=0)) == "queuedDL"
+    # Still genuinely downloading in the cloud with no peers -> still stalled.
+    assert qbit_api._qbit_state(mk(cloud_progress=0.4, dlspeed=0)) == "stalledDL"
 
 
 # --------------------------------------------------------------------------- #
@@ -143,3 +156,87 @@ def test_login_then_authorized_then_logout(client):
 
     client.post("/api/v2/auth/logout")
     assert client.get("/api/v2/torrents/info").status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# local deletion follows the same layout the worker wrote
+# --------------------------------------------------------------------------- #
+def _seed(rel: str) -> str:
+    """Create a file under the real (temp) download dir and return its path."""
+    from app import worker
+    dest = worker._safe_dest("radarr", rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as fh:
+        fh.write(b"x")
+    return dest
+
+
+def test_delete_local_removes_the_folder_made_for_loose_files():
+    from app import worker
+    from app.store import Torrent
+
+    t = Torrent(hash="a" * 40, name="Del.Loose.S01E01", category="radarr",
+                files=[{"id": 1, "name": "a.mkv"}, {"id": 2, "name": "b.nfo"}])
+    a = _seed("Del.Loose.S01E01/a.mkv")
+    _seed("Del.Loose.S01E01/b.nfo")
+    folder = os.path.dirname(a)
+
+    qbit_api._delete_local(t)
+    assert not os.path.exists(folder)
+
+
+def test_delete_local_removes_a_torrents_own_folder():
+    from app.store import Torrent
+
+    t = Torrent(hash="b" * 40, name="X", category="radarr",
+                files=[{"id": 1, "name": "DelPack/a.mkv"}, {"id": 2, "name": "DelPack/b.mkv"}])
+    a = _seed("DelPack/a.mkv")
+    _seed("DelPack/b.mkv")
+    folder = os.path.dirname(a)
+
+    qbit_api._delete_local(t)
+    assert not os.path.exists(folder)
+
+
+# --------------------------------------------------------------------------- #
+# what Sonarr/Radarr need before they will remove an imported download
+# --------------------------------------------------------------------------- #
+def test_completed_torrent_reads_as_done_seeding():
+    """HasReachedSeedLimit() only consults a limit when it is >= 0; -1 means
+    unlimited and is skipped entirely, so the item is never removable and
+    CanMoveFiles stays false (turning every import into a copy)."""
+    from app.store import STATE_COMPLETED, Torrent
+
+    q = qbit_api._to_qbit(Torrent(hash="a" * 40, name="x", category="sonarr",
+                                  size=100, state=STATE_COMPLETED,
+                                  completion_on=1, local_progress=1.0))
+    assert q["ratio_limit"] == 0 and q["ratio"] == 0.0        # limit - ratio <= 0.001
+    assert q["seeding_time_limit"] == 0 and q["seeding_time"] == 0  # seeding_time >= limit
+    assert q["progress"] == 1.0
+    # Unlimited, so a global inactive-seeding limit can't make this removable
+    # for the wrong reason.
+    assert q["inactive_seeding_time_limit"] == -1
+    assert q["last_activity"] > 0
+
+
+def test_completed_state_is_pausedup_for_version_compatibility():
+    """stoppedUP is only understood from Sonarr v4.0.5.1710 / Radarr v5.5.3.8819.
+    Older builds treat an unknown state as still Downloading and never import at
+    all, so this must stay pausedUP."""
+    from app.store import STATE_COMPLETED, Torrent
+
+    assert qbit_api._qbit_state(Torrent(hash="a" * 40, name="x",
+                                        state=STATE_COMPLETED)) == "pausedUP"
+
+
+def test_incomplete_torrent_is_not_reported_as_finished():
+    """The seed limits say "no seeding required"; they must not make an
+    unfinished download look importable."""
+    from app.store import STATE_DOWNLOADING, Torrent
+
+    q = qbit_api._to_qbit(Torrent(hash="a" * 40, name="x", category="sonarr",
+                                  size=100, state=STATE_DOWNLOADING,
+                                  local_progress=0.5))
+    assert q["progress"] < 1.0
+    assert q["state"] == "downloading"
+    assert q["amount_left"] > 0

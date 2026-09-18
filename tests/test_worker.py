@@ -46,10 +46,58 @@ def test_content_path_single_root_folder():
     assert cp.endswith(os.path.join("radarr", "Movie (2026)"))
 
 
-def test_content_path_multiple_roots_falls_back_to_base():
+def test_content_path_single_file_keeps_torbox_layout():
     t = Torrent(hash="a" * 40, name="X", category="radarr")
-    files = [{"name": "a.mkv"}, {"name": "b.mkv"}]
-    assert worker._content_path(t, files) == worker._save_path("radarr")
+    files = [{"name": "movie.mkv"}]
+    assert worker._content_path(t, files) == os.path.join(worker._save_path("radarr"), "movie.mkv")
+    assert worker._root_folder(t.name, files) == ""
+
+
+def test_content_path_multiple_roots_gets_its_own_folder():
+    """Sonarr refuses a completed torrent whose content_path is the client's
+    base download dir, so loose files need a folder made for them."""
+    t = Torrent(hash="a" * 40, name="Show.S01E01", category="radarr")
+    files = [{"name": "a.mkv"}, {"name": "b.nfo"}]
+    base = worker._save_path("radarr")
+    assert worker._content_path(t, files) == os.path.join(base, "Show.S01E01")
+    assert worker._content_path(t, files) != base
+    assert worker._root_folder(t.name, files) == "Show.S01E01"
+
+
+def test_content_path_without_files_is_still_below_base():
+    t = Torrent(hash="a" * 40, name="Nothing Yet", category="radarr")
+    base = worker._save_path("radarr")
+    assert worker._content_path(t, []) == os.path.join(base, "Nothing Yet")
+
+
+@pytest.mark.parametrize("name", [
+    "../../etc/passwd", "a/b", "..", ".", "   ", "", "C:\\evil\\x", "  ..  ",
+])
+def test_as_segment_stays_one_harmless_segment(name):
+    """A torrent name comes from TorBox, so it has to be safe to use as a
+    directory name — one segment, never empty, never a traversal."""
+    seg = worker._as_segment(name)
+    assert seg and "/" not in seg and "\\" not in seg
+    assert seg not in (".", "..")
+    # And it survives the path guard rather than blowing up a download.
+    worker._safe_dest("radarr", os.path.join(seg, "f.mkv"))
+
+
+def test_as_segment_keeps_ordinary_names_intact():
+    assert worker._as_segment("Show.S01E01.1080p-GRP") == "Show.S01E01.1080p-GRP"
+
+
+def test_file_dest_puts_loose_files_under_the_made_folder():
+    t = Torrent(hash="a" * 40, name="Show.S01E01", category="radarr",
+                files=[{"id": 1, "name": "a.mkv"}, {"id": 2, "name": "b.nfo"}])
+    dest = worker._file_dest(t, t.files[0])
+    assert dest == worker._safe_dest("radarr", "Show.S01E01/a.mkv")
+
+
+def test_file_dest_leaves_a_torrents_own_folder_alone():
+    t = Torrent(hash="a" * 40, name="X", category="radarr",
+                files=[{"id": 1, "name": "Pack/a.mkv"}, {"id": 2, "name": "Pack/b.mkv"}])
+    assert worker._file_dest(t, t.files[0]) == worker._safe_dest("radarr", "Pack/a.mkv")
 
 
 def test_map_files_normalises_backslashes_and_size():
@@ -124,8 +172,10 @@ class _FakeClient:
     def __init__(self, entries=None):
         self.entries = entries or []
         self.deleted = []
+        self.list_calls = 0
 
     async def my_list(self):
+        self.list_calls += 1
         return self.entries
 
     async def control(self, tid, op):
@@ -146,6 +196,37 @@ async def test_cleanup_deletes_old_cloud_copy_keeps_recent(worker_env, monkeypat
     assert worker_env.get("a" * 40).torbox_id is None
     assert worker_env.get("b" * 40).torbox_id == 43
     assert any(e["event"] == "cloud_removed" for e in worker_env.history())
+    # Cleanup deletes by torbox_id, so it never needed the listing.
+    assert fake.list_calls == 0
+
+
+async def test_sync_once_skips_poll_when_nothing_actionable(worker_env, monkeypatch):
+    """Completed/errored rows are kept so the *arr apps can still import them,
+    but they are never matched against a mylist entry — polling for those alone
+    is a full uncached listing of the account with nothing to do."""
+    fake = _FakeClient()
+    monkeypatch.setattr(worker, "client", fake)
+    worker_env.upsert(Torrent(hash="a" * 40, name="done", state=STATE_COMPLETED,
+                              torbox_id=None, completion_on=int(time.time())))
+    worker_env.upsert(Torrent(hash="b" * 40, name="bad", state=STATE_ERROR, torbox_id=None))
+    await worker.sync_once()
+    assert fake.list_calls == 0
+
+
+async def test_sync_once_polls_when_something_is_actionable(worker_env, monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(worker, "client", fake)
+    worker_env.upsert(Torrent(hash="a" * 40, name="done", state=STATE_COMPLETED, torbox_id=None))
+    worker_env.upsert(Torrent(hash="b" * 40, name="busy", state=STATE_CLOUD, torbox_id=7))
+    await worker.sync_once()
+    assert fake.list_calls == 1
+
+
+async def test_sync_once_empty_store_skips_poll(worker_env, monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(worker, "client", fake)
+    await worker.sync_once()
+    assert fake.list_calls == 0
 
 
 async def test_parallel_torrent_gate(worker_env, monkeypatch):
@@ -190,6 +271,128 @@ async def test_download_failure_cancels_sibling_and_requeues(worker_env, monkeyp
 
     assert sibling_cancelled["v"] is True          # no orphaned writer left running
     assert worker_env.get(h).state == STATE_CLOUD  # first failure -> retry, not error
+    assert h not in worker._downloading
+
+
+# --------------------------------------------------------------------------- #
+# stall watchdog: a pull that stops getting anywhere must not hold a slot
+# --------------------------------------------------------------------------- #
+def test_stall_floor_is_flat_when_uncapped(monkeypatch):
+    monkeypatch.setitem(runtime._values, "max_download_speed", 0)
+    assert worker._stall_floor(90) == worker._STALL_FLOOR_BYTES
+
+
+def test_stall_floor_scales_down_to_a_configured_cap(monkeypatch):
+    monkeypatch.setitem(runtime._values, "max_download_speed", 0.01)  # ~10 KiB/s
+    # A quarter of what the cap allows in the window, so the limiter itself
+    # can never be mistaken for a stall.
+    assert worker._stall_floor(90) == int(0.01 * (1 << 20) * 90 / 4)
+    assert worker._stall_floor(90) < worker._STALL_FLOOR_BYTES
+
+
+def test_stall_floor_never_reaches_zero(monkeypatch):
+    monkeypatch.setitem(runtime._values, "max_download_speed", 0.000001)
+    assert worker._stall_floor(1) >= 1
+
+
+async def test_stalled_pull_is_cancelled_and_requeued(worker_env, monkeypatch):
+    """The headline fix: a stream that opens, delivers almost nothing and never
+    errors used to hold its MAX_PARALLEL_TORRENTS slot forever. httpx's read
+    timeout can't see it, because bytes technically still arrive."""
+    h = "a" * 40
+    worker_env.upsert(Torrent(hash=h, name="x", category="radarr", torbox_id=1,
+                              state=STATE_DOWNLOADING,
+                              files=[{"id": 1, "name": "f.mkv", "size": 1 << 30}]))
+    cancelled = {"v": False}
+
+    async def trickle(t, f, progress):
+        progress["done"] += 16  # a token few bytes, then nothing, forever
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled["v"] = True
+            raise
+
+    monkeypatch.setattr(worker, "_download_file", trickle)
+    monkeypatch.setattr(worker, "_PROGRESS_TICK", 0.01)
+    monkeypatch.setattr(worker, "_stall_window", lambda: 0.05)
+    worker._downloading.add(h)
+    await worker._download_torrent(h)
+
+    assert cancelled["v"] is True                   # the stream was torn down
+    assert worker_env.get(h).state == STATE_CLOUD   # requeued for another round
+    assert h not in worker._downloading             # and the slot is free again
+    assert worker._attempts[h] == 1
+
+
+async def test_slow_but_progressing_pull_is_left_alone(worker_env, monkeypatch):
+    """Clearing the floor each window must keep a genuinely slow pull running."""
+    h = "a" * 40
+    worker_env.upsert(Torrent(hash=h, name="x", category="radarr", torbox_id=1,
+                              state=STATE_DOWNLOADING,
+                              files=[{"id": 1, "name": "f.mkv", "size": 8 << 20}]))
+
+    async def slow(t, f, progress):
+        for _ in range(8):
+            await asyncio.sleep(0.02)
+            progress["done"] += 1 << 20
+
+    monkeypatch.setattr(worker, "_download_file", slow)
+    monkeypatch.setattr(worker, "_PROGRESS_TICK", 0.01)
+    monkeypatch.setattr(worker, "_stall_window", lambda: 0.05)
+    worker._downloading.add(h)
+    await worker._download_torrent(h)
+
+    assert worker_env.get(h).state == STATE_COMPLETED
+
+
+async def test_watchdog_disabled_by_zero_window(worker_env, monkeypatch):
+    h = "a" * 40
+    worker_env.upsert(Torrent(hash=h, name="x", category="radarr", torbox_id=1,
+                              state=STATE_DOWNLOADING,
+                              files=[{"id": 1, "name": "f.mkv", "size": 10}]))
+
+    async def quick(t, f, progress):
+        await asyncio.sleep(0.05)  # longer than a window would be, if there were one
+        progress["done"] += 10
+
+    monkeypatch.setattr(worker, "_download_file", quick)
+    monkeypatch.setattr(worker, "_PROGRESS_TICK", 0.01)
+    monkeypatch.setattr(worker, "_stall_window", lambda: 0)
+    worker._downloading.add(h)
+    await worker._download_torrent(h)
+    assert worker_env.get(h).state == STATE_COMPLETED
+
+
+async def test_pull_is_cancelled_when_the_torrent_is_removed(worker_env, monkeypatch):
+    """Deleting from Sonarr used to leave the file streams writing to disk —
+    re-creating the very files torrents/delete had just removed."""
+    h = "a" * 40
+    worker_env.upsert(Torrent(hash=h, name="x", category="radarr", torbox_id=1,
+                              state=STATE_DOWNLOADING,
+                              files=[{"id": 1, "name": "f.mkv", "size": 1 << 30}]))
+    cancelled = {"v": False}
+
+    async def long_pull(t, f, progress):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled["v"] = True
+            raise
+
+    async def remove_soon():
+        await asyncio.sleep(0.02)
+        worker_env.delete(h)
+
+    monkeypatch.setattr(worker, "_download_file", long_pull)
+    monkeypatch.setattr(worker, "_PROGRESS_TICK", 0.01)
+    worker._downloading.add(h)
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(remove_soon())
+        tg.create_task(worker._download_torrent(h))
+
+    assert cancelled["v"] is True
+    assert worker_env.get(h) is None
     assert h not in worker._downloading
 
 

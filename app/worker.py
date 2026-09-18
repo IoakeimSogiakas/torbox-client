@@ -10,7 +10,6 @@ Loop:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import time
@@ -38,6 +37,16 @@ _attempts: dict[str, int] = {}
 _TORRENT_RETRY_LIMIT = 3
 
 _FAILED_STATES = {"failed", "error", "cberror", "uploaderror"}
+
+# Seconds between local-progress writes (and stall-watchdog checks).
+_PROGRESS_TICK = 3
+# Bytes a torrent's local pull must gain inside one watchdog window to count as
+# alive. settings.stall_timeout is enforced by httpx as a *read* timeout, which
+# only fires when a socket goes completely silent — a CDN stream that trickles a
+# few KiB keeps it happy indefinitely while the torrent sits just short of done
+# forever, holding a MAX_PARALLEL_TORRENTS slot nothing else can use. Measuring
+# actual bytes catches the trickle as well as the silence.
+_STALL_FLOOR_BYTES = 1 << 20  # 1 MiB
 
 # Caps concurrent file streams across all torrents. Created lazily on the running
 # loop (asyncio primitives bind to the loop that first awaits them).
@@ -152,17 +161,51 @@ def _save_path(category: str) -> str:
     return os.path.join(settings.save_path_base, category) if category else settings.save_path_base
 
 
+def _top_segments(files: list[dict]) -> set[str]:
+    """First path segment of every file — the torrent's root folder, if it has one."""
+    return {n.replace("\\", "/").split("/", 1)[0]
+            for n in (f.get("name", "") for f in files) if n}
+
+
+def _as_segment(name: str) -> str:
+    """A torrent name reduced to one safe path segment."""
+    seg = name.replace("\\", "/").replace("/", "_").strip().strip(".")
+    return seg or "torrent"
+
+
+def _root_folder(name: str, files: list[dict]) -> str:
+    """Folder inside the category dir to put this torrent's files in.
+
+    Empty when the torrent's files already share one top-level segment — a
+    single file, or a release that ships its own folder — because then that
+    segment is the root and TorBox's layout is kept as-is.
+
+    Otherwise we make a folder named after the torrent, the same way real
+    qBittorrent does with ``create_subfolder_enabled``. Loose files written
+    straight into the category dir have no root to point Sonarr/Radarr at, and
+    they collide between torrents.
+    """
+    return "" if len(_top_segments(files)) == 1 else _as_segment(name)
+
+
 def _content_path(t: Torrent, files: list[dict]) -> str:
-    """Root file/folder path as the *arr apps should see it."""
+    """Root file/folder path as the *arr apps should see it.
+
+    Never the bare category dir: Sonarr/Radarr refuse to import a completed
+    torrent whose content_path equals the download client's own base path
+    ("Unable to Import. Path matches client base download directory").
+    """
     base = _save_path(t.category)
-    names = [f.get("name", "") for f in files if f.get("name")]
-    if not names:
-        return os.path.join(base, t.name)
-    # Common first path segment == the torrent's root folder (or a single file).
-    tops = {n.replace("\\", "/").split("/", 1)[0] for n in names}
-    if len(tops) == 1:
-        return os.path.join(base, next(iter(tops)))
-    return base
+    root = _root_folder(t.name, files)
+    if root:
+        return os.path.join(base, root)
+    return os.path.join(base, next(iter(_top_segments(files))))
+
+
+def _file_dest(t: Torrent, file: dict) -> str:
+    """Local path a torrent's file is written to."""
+    rel = os.path.join(_root_folder(t.name, t.files), file.get("name", ""))
+    return _safe_dest(t.category, rel)
 
 
 def _map_files(entry: dict) -> list[dict]:
@@ -202,7 +245,7 @@ async def _download_file(t: Torrent, file: dict, progress: dict) -> None:
     file_id = file["id"]
     rel = file["name"]
     expected = int(file.get("size") or 0)
-    dest = _safe_dest(t.category, rel)
+    dest = _file_dest(t, file)
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
 
     existing = os.path.getsize(dest) if os.path.exists(dest) else 0
@@ -246,6 +289,29 @@ async def _download_file(t: Torrent, file: dict, progress: dict) -> None:
     raise IOError(f"{rel} failed after {settings.download_retries} attempts: {last_err!r}")
 
 
+def _stall_window() -> float:
+    """Seconds of no real progress before a torrent's local pull is abandoned.
+
+    Twice ``stall_timeout`` so that one full per-file retry cycle (the httpx
+    read timeout plus its backoff) can play out and recover on its own before
+    the torrent-level watchdog steps in. 0 disables the watchdog.
+    """
+    return max(settings.stall_timeout, 0) * 2
+
+
+def _stall_floor(window: float) -> int:
+    """Bytes that must arrive within ``window`` before we call a pull stalled.
+
+    A configured speed cap can legitimately hold throughput under the flat
+    floor, so never demand more than a quarter of what the cap allows.
+    """
+    floor = _STALL_FLOOR_BYTES
+    cap = runtime.get("max_download_speed") * (1 << 20)  # bytes/s, 0 = unlimited
+    if cap > 0:
+        floor = min(floor, int(cap * window / 4))
+    return max(floor, 1)
+
+
 async def _download_torrent(hash_: str) -> None:
     t = store.get(hash_)
     if not t or not t.torbox_id or not t.files:
@@ -261,33 +327,59 @@ async def _download_torrent(hash_: str) -> None:
     started = time.time()
     log.info("Downloading %s (%d files, %.2f GiB)", t.name, len(t.files), total / (1 << 30))
     try:
-        # A light periodic progress writer while files stream in.
+        window = _stall_window()
+
+        # A light periodic progress writer while files stream in, doubling as
+        # the watchdog that ends a pull which has stopped getting anywhere.
         async def _report() -> None:
             last_done = progress["done"]
+            mark_done = progress["done"]      # bytes at the start of this window
+            mark_time = time.monotonic()
             while True:
-                await asyncio.sleep(3)
+                await asyncio.sleep(_PROGRESS_TICK)
                 cur = store.get(hash_)
                 if not cur:
-                    return
+                    return  # removed from under us; the caller cancels the pull
                 cur.state = STATE_DOWNLOADING
                 cur.local_progress = min(progress["done"] / total, 1.0)
                 # Windowed speed: shows 0 during a stall instead of a decaying average.
-                cur.dlspeed = max(int((progress["done"] - last_done) / 3), 0)
+                cur.dlspeed = max(int((progress["done"] - last_done) / _PROGRESS_TICK), 0)
                 last_done = progress["done"]
                 store.upsert(cur)
 
-        reporter = asyncio.create_task(_report())
-        try:
+                if window <= 0:
+                    continue
+                gained = progress["done"] - mark_done
+                if gained >= _stall_floor(window):
+                    mark_done, mark_time = progress["done"], time.monotonic()
+                elif time.monotonic() - mark_time >= window:
+                    raise TimeoutError(
+                        f"only {gained / (1 << 10):.0f} KiB in "
+                        f"{int(time.monotonic() - mark_time)}s")
+
+        async def _pull_files() -> None:
             # TaskGroup (unlike gather) cancels the still-running file downloads
             # as soon as one fails, so a failed torrent leaves no detached tasks
             # writing to disk when we retry it — that used to corrupt files.
             async with asyncio.TaskGroup() as tg:
                 for f in t.files:
                     tg.create_task(_download_file(t, f, progress))
+
+        files = asyncio.create_task(_pull_files())
+        reporter = asyncio.create_task(_report())
+        try:
+            finished, _ = await asyncio.wait(
+                {files, reporter}, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            # Whichever finished, the other one is done here: cancelling the
+            # pull also stops every file stream writing to disk.
+            files.cancel()
             reporter.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reporter
+            await asyncio.gather(files, reporter, return_exceptions=True)
+        if files in finished:
+            files.result()     # the pull won the race: success, or its own failure
+        else:
+            reporter.result()  # the watchdog tripped, or the row vanished under us
 
         done = store.get(hash_)
         if not done:
@@ -342,7 +434,7 @@ def _files_local(t: Torrent) -> bool:
         return False
     for f in t.files:
         try:
-            dest = _safe_dest(t.category, f.get("name", ""))
+            dest = _file_dest(t, f)
             if os.path.getsize(dest) != int(f.get("size") or 0):
                 return False
         except (OSError, ValueError):
@@ -415,10 +507,31 @@ def resume_interrupted() -> None:
             log.info("Resuming interrupted local download after restart: %s", t.name)
 
 
+def _needs_cloud_cleanup(t: Torrent, now: int, cleanup_after: float) -> bool:
+    return bool(t.state == STATE_COMPLETED and cleanup_after > 0 and t.torbox_id is not None
+                and t.completion_on and now - t.completion_on >= cleanup_after)
+
+
 async def sync_once() -> None:
     tracked = store.all()
+    now = int(time.time())
+    cleanup_after = runtime.get("torbox_cleanup_hours") * 3600
+
+    # Age-based cloud cleanup deletes by id, so it needs no listing — run it
+    # before deciding whether the poll itself is worth making.
+    for t in tracked:
+        if _needs_cloud_cleanup(t, now, cleanup_after):
+            await _cleanup_cloud(t)
+
+    # Completed/errored rows are kept on purpose (Sonarr/Radarr still have to
+    # import them), but they are never matched against a mylist entry — after
+    # _cleanup_cloud() they don't even have a torbox_id any more. Polling for
+    # those alone means an uncached listing of the whole TorBox account every
+    # POLL_INTERVAL, forever, with nothing to do.
+    tracked = [t for t in tracked if t.state not in (STATE_COMPLETED, STATE_ERROR)]
     if not tracked:
         return
+
     try:
         entries = await client.my_list()
     except Exception as exc:  # noqa: BLE001
@@ -430,15 +543,8 @@ async def sync_once() -> None:
 
     by_id = {e.get("id"): e for e in entries if e.get("id") is not None}
     by_hash = {str(e.get("hash", "")).lower(): e for e in entries}
-    now = int(time.time())
-    cleanup_after = runtime.get("torbox_cleanup_hours") * 3600
 
     for t in tracked:
-        if (t.state == STATE_COMPLETED and cleanup_after > 0 and t.torbox_id is not None
-                and t.completion_on and now - t.completion_on >= cleanup_after):
-            await _cleanup_cloud(t)
-        if t.state in (STATE_COMPLETED, STATE_ERROR):
-            continue
         entry = None
         if t.torbox_id is not None:
             entry = by_id.get(t.torbox_id)

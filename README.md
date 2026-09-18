@@ -18,6 +18,9 @@ Sonarr/Radarr ──(qBittorrent API)──▶ torbox-client ──(TorBox API)�
 4. When TorBox finishes, the worker downloads each file to `/downloads/<category>/…`.
 5. Once every file is local, the torrent reports **completed** and Sonarr/Radarr import it (hardlink/move into your library).
 6. After import, *arr removes it; the service deletes the local files and (optionally) the TorBox cloud torrent.
+   Completed torrents are reported with their seeding requirement already satisfied, which is what lets
+   Sonarr/Radarr's **Remove Completed Downloads** fire — seeding, if you want it, happens on TorBox's side
+   via `TORBOX_SEED`, not locally.
 
 ## Prerequisites
 
@@ -168,11 +171,12 @@ All configuration is via environment variables (see `.env.example`):
 | `SAVE_PATH` | = `DOWNLOAD_DIR` | Path reported to *arr (set only if their mount path differs). |
 | `PUID` / `PGID` | `1000` / `1000` | File ownership. **Use `99` / `100` on Unraid.** |
 | `UMASK` | `022` | Umask for created files. |
-| `POLL_INTERVAL` | `15` | Seconds between TorBox status polls. |
+| `POLL_INTERVAL` | `15` | Seconds between TorBox status polls. Polls are skipped entirely while nothing is downloading. |
+| `TORBOX_BYPASS_CACHE` | `true` | Ask TorBox to skip its own cache on each status poll. Freshest progress, but the most expensive request we make — set `false` on a large account if you poll often. |
 | `MAX_PARALLEL_DOWNLOADS` | `4` | Concurrent file downloads from the TorBox CDN. |
 | `MAX_PARALLEL_TORRENTS` | `2` | Torrents pulled locally at the same time (0 = unlimited). |
 | `MAX_DOWNLOAD_SPEED` | `0` | Aggregate download cap in MiB/s across all files (0 = unlimited). Converting from Mbps: divide by ~8.4 — 50 Mbps ≈ `6`, 100 Mbps ≈ `12`, 1 Gbps ≈ `119`. |
-| `STALL_TIMEOUT` | `90` | Seconds without data before a stalled stream is retried with a fresh link. |
+| `STALL_TIMEOUT` | `90` | Seconds without data before a stalled stream is retried with a fresh link. A torrent whose local pull gains under 1 MiB in twice this long is abandoned and requeued, so a trickling CDN connection can't hold a download slot forever. |
 | `DOWNLOAD_RETRIES` | `4` | Attempts per file; each retry resumes from the bytes already on disk. |
 | `TORBOX_CLEANUP_HOURS` | `24` | Delete the TorBox **cloud** copy this long after the local download completes, freeing your TorBox active-torrent slots (local files kept; 0 = never). ✏️ |
 | `CLOUD_MAX_AGE_DAYS` | `0` | Delete **any** item in the TorBox account older than this many days, tracked or not (0 = off). Items still being pulled locally are spared. ✏️ |

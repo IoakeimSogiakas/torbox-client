@@ -233,12 +233,23 @@ def _qbit_state(t: Torrent) -> str:
     if t.state == STATE_ERROR:
         return "error"
     if t.state == STATE_COMPLETED:
-        return "stoppedUP"  # previously was "pausedUP" finished + safe to import/remove
+        # pausedUP, not the newer stoppedUP: both mean the same thing to a
+        # current *arr, but stoppedUP only landed in Sonarr v4.0.5.1710 and
+        # Radarr v5.5.3.8819. Older builds drop it into their `default:` arm,
+        # which reports the item as still Downloading, and
+        # CompletedDownloadService.Check() bails unless the status is Completed
+        # — so they would stop importing entirely. pausedUP is understood by
+        # every version. Don't "modernise" this.
+        return "pausedUP"  # finished + safe to import/remove
     if t.state == STATE_DOWNLOADING:
         return "downloading"
     if t.state == STATE_QUEUED:
         return "metaDL"
-    # cloud phase
+    # Cloud phase. A torrent TorBox has already finished is waiting for a local
+    # download slot, not stalled — Sonarr renders stalledDL as "The download is
+    # stalled with no connections", which is both wrong and alarming here.
+    if t.cloud_progress >= 0.999:
+        return "queuedDL"
     return "downloading" if t.dlspeed > 0 else "stalledDL"
 
 
@@ -266,6 +277,16 @@ def _to_qbit(t: Torrent) -> dict:
         "num_leechs": 0,
         "num_incomplete": 0,
         "ratio": 0.0,
+<<<<<<< HEAD
+=======
+        # 0, not -1. Sonarr/Radarr gate removal on HasReachedSeedLimit(), which
+        # only consults a limit when it is >= 0 (or -2, meaning "use the client's
+        # global"). -1 means "unlimited", so both branches are skipped, the item
+        # never counts as done seeding, and "Remove Completed Downloads" never
+        # fires. With 0 against our ratio of 0.0 the limit reads as already met.
+        # This also drives CanMoveFiles, so -1 silently turned every import into
+        # a copy instead of a move.
+>>>>>>> upstream/main
         "ratio_limit": 0,
         "eta": eta,
         "state": _qbit_state(t),
@@ -282,7 +303,15 @@ def _to_qbit(t: Torrent) -> dict:
         "amount_left": amount_left,
         "time_active": max(now - (t.added_on or now), 0),
         "seeding_time": 0,
+<<<<<<< HEAD
         "seeding_time_limit": 0,
+=======
+        "seeding_time_limit": 0,  # same reasoning as ratio_limit
+        # Explicitly unlimited. Left absent it deserializes to -2 ("use global"),
+        # and a global inactive-seeding limit would then be measured against
+        # last_activity, making every torrent instantly removable.
+        "inactive_seeding_time_limit": -1,
+>>>>>>> upstream/main
         "last_activity": t.last_update or now,
         "auto_tmm": False,
         "availability": 1.0 if progress >= 1 else -1.0,
@@ -486,7 +515,10 @@ async def torrents_add(request: Request) -> Response:
 
 def _delete_local(t: Torrent) -> None:
     """Remove the downloaded content (file or root folder) from local disk."""
-    roots = {f.get("name", "").split("/", 1)[0] for f in t.files if f.get("name")}
+    # A torrent we gave its own folder is removed by that folder; otherwise by
+    # each top-level name TorBox reported.
+    made_root = worker._root_folder(t.name, t.files)
+    roots = {made_root} if made_root else worker._top_segments(t.files)
     for root in roots:
         if not root:
             continue
