@@ -277,8 +277,6 @@ def _to_qbit(t: Torrent) -> dict:
         "num_leechs": 0,
         "num_incomplete": 0,
         "ratio": 0.0,
-<<<<<<< HEAD
-=======
         # 0, not -1. Sonarr/Radarr gate removal on HasReachedSeedLimit(), which
         # only consults a limit when it is >= 0 (or -2, meaning "use the client's
         # global"). -1 means "unlimited", so both branches are skipped, the item
@@ -286,7 +284,6 @@ def _to_qbit(t: Torrent) -> dict:
         # fires. With 0 against our ratio of 0.0 the limit reads as already met.
         # This also drives CanMoveFiles, so -1 silently turned every import into
         # a copy instead of a move.
->>>>>>> upstream/main
         "ratio_limit": 0,
         "eta": eta,
         "state": _qbit_state(t),
@@ -303,15 +300,11 @@ def _to_qbit(t: Torrent) -> dict:
         "amount_left": amount_left,
         "time_active": max(now - (t.added_on or now), 0),
         "seeding_time": 0,
-<<<<<<< HEAD
-        "seeding_time_limit": 0,
-=======
         "seeding_time_limit": 0,  # same reasoning as ratio_limit
         # Explicitly unlimited. Left absent it deserializes to -2 ("use global"),
         # and a global inactive-seeding limit would then be measured against
         # last_activity, making every torrent instantly removable.
         "inactive_seeding_time_limit": -1,
->>>>>>> upstream/main
         "last_activity": t.last_update or now,
         "auto_tmm": False,
         "availability": 1.0 if progress >= 1 else -1.0,
